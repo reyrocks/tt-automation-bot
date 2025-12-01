@@ -1,0 +1,7 @@
+2025/12/01-15:10:29.421 d198 Reusing MANIFEST D:\Data Joni\automation register\tt-automation-bot\profiles_tt\tt_OrangeGalago_tempomail_id\Default\Local Storage\leveldb/MANIFEST-000001
+2025/12/01-15:10:29.427 d198 Recovering log #3
+2025/12/01-15:10:29.428 d198 Level-0 table #3: started
+2025/12/01-15:10:29.434 d198 Level-0 table #3: 108580 bytes OK
+2025/12/01-15:10:29.435 d198 Recovering log #4
+2025/12/01-15:10:29.437 d198 Reusing old log D:\Data Joni\automation register\tt-automation-bot\profiles_tt\tt_OrangeGalago_tempomail_id\Default\Local Storage\leveldb/000004.log 
+2025/12/01-15:10:29.439 d198 Delete type=0 #3
