@@ -1,8 +1,10 @@
 import { chromium } from 'playwright-extra'; 
+import { Page, Locator } from 'playwright';
 import stealthPlugin from 'puppeteer-extra-plugin-stealth';
 import { createCursor } from 'ghost-cursor'; 
 import { readAccountsFromExcel } from './utils/excelReader'; 
-import { humanType, randomDelay } from './utils/humanHelper'; 
+import { humanType, randomDelay } from './utils/humanHelper';
+import { selectGenderMale } from './utils/genderHelper';
 import fs from 'fs';
 import path from 'path';
 
@@ -12,6 +14,7 @@ const DATA_PATH = './data/tiktok_data.xlsx';
 const PROFILES_DIR = './profiles_tt';
 const COOKIES_DIR = './cookies_tt';
 const LOGS_DIR = './logs';
+const sex = "male";
 
 [PROFILES_DIR, COOKIES_DIR, LOGS_DIR].forEach(dir => {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir);
@@ -183,7 +186,7 @@ async function registerTikTok(account: any) {
         await humanType(page, 'input[type="password"]', account.password);
         await randomDelay(1000, 2000);
 
-        // 7. KLIK KIRIM KODE
+        // 6. KLIK KIRIM KODE
         console.log('-> Klik tombol "Kirim Kode"...');
         const btnSend = page.getByRole('button', { name: 'Kirim kode' }).or(page.getByRole('button', { name: 'Send code' }));
         
@@ -193,7 +196,105 @@ async function registerTikTok(account: any) {
             console.log('   [WARNING] Tombol Kirim Kode tidak ketemu.');
         }
 
-        // 8. INPUT MANUAL
+        // 7. BUKA GMAIL UNTUK AMBIL KODE OTP
+        console.log('-> Membuka Gmail untuk ambil kode OTP...');
+        const gmailPage = await context.newPage();
+        await gmailPage.goto('https://mail.google.com/', { waitUntil: 'domcontentloaded' });
+        await randomDelay(5000, 8000);
+        
+        // 8. LOGIN GMAIL JIKA PERLU
+        if (await gmailPage.isVisible('input[type="email"]')) {
+            console.log('   Login Gmail...');
+            await humanType(gmailPage, 'input[type="email"]', account.email);
+            await gmailPage.click('button:has-text("Berikutnya")', { force: true });
+            await randomDelay(3000, 5000);
+            await humanType(gmailPage, 'input[type="password"]', account.password);
+            await gmailPage.click('button:has-text("Berikutnya")', { force: true });
+            await randomDelay(8000, 12000);
+        }
+        
+        // 9. CARI EMAIL DARI TIKTOK
+        console.log('-> Mencari email dari TikTok...');
+        let otpCode = '';
+        const maxRetries = 12;
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                await gmailPage.reload({ waitUntil: 'domcontentloaded' });
+                await randomDelay(5000, 8000);
+                const emailRow = gmailPage.locator('tr').filter({ hasText: 'TikTok' }).first();
+                if (await emailRow.isVisible()) {
+                    console.log('   Email TikTok ditemukan, membukanya...');
+                    await emailRow.click({ force: true });
+                    await randomDelay(5000, 8000);
+                    const emailBody = gmailPage.frameLocator('iframe[name="msg_body"]').locator('body');
+                    const emailText = await emailBody.innerText();
+                    const codeMatch = emailText.match(/(\d{6})/);
+                    if (codeMatch) {
+                        otpCode = codeMatch[1];
+                        console.log(`   Kode OTP Ditemukan: ${otpCode}`);
+                        break;
+                    }
+                } else {
+                    console.log(`   [${attempt}/${maxRetries}] Email TikTok belum ada, menunggu...`);
+                }
+            } catch(e) {
+                console.log(`   [${attempt}/${maxRetries}] Gagal mencari email, coba lagi...`);
+            }
+            await randomDelay(10000, 15000);
+        }
+
+        if (!otpCode) {
+            throw new Error('Gagal mendapatkan kode OTP dari email.');
+        }
+        await gmailPage.close();
+        await randomDelay(2000, 4000);
+        
+        // ISI KODE OTP
+        console.log('-> Mengisi Kode OTP di TikTok...');
+        const codeInputs = await page.$$('input[type="text"][maxlength="1"]');  
+        if (codeInputs.length === 6) {
+            for (let i = 0; i < 6; i++) {
+                await codeInputs[i].fill(otpCode.charAt(i));
+                await randomDelay(300, 600);
+            }   
+        } else {
+            console.log('   [WARNING] Input kode OTP tidak ditemukan sesuai format.');
+        }
+        await randomDelay(2000, 3000);
+
+        // 10. PILIH USERNAME OTOMATIS
+        async function selectGenderMale(page: Page): Promise<void> {
+            console.log('-> Memilih Gender: Male');
+
+            try {
+                const maleOptions: Locator[] = [
+                    page.getByText(/^Male$/i),
+                    page.getByText(/^Laki-laki$/i),
+                    page.getByRole('radio', { name: /male|laki/i }),
+                    page.locator('div').filter({ hasText: /male|laki/i })
+                ];
+
+                for (const opt of maleOptions) {
+                    const el = opt.first();
+
+                    // ✅ cek count dulu (lebih aman dari isVisible error)
+                    if (await el.count() === 0) continue;
+
+                    if (await el.isVisible()) {
+                        await el.click({ force: true });
+                        await randomDelay(500, 1000);
+                        console.log('   Gender Male dipilih');
+                        return;
+                    }
+                }
+
+                console.log('   [INFO] Field gender tidak ditemukan (mungkin dilewati TikTok)');
+            } catch (error) {
+                console.log('   [WARNING] Gagal memilih gender');
+            }
+        }
+
+        // . INPUT MANUAL
         console.log('\n================================================================');
         console.log('✋ WAKTUNYA INPUT MANUAL! (Bot Pause 3 Menit)');
         console.log('1. Selesaikan PUZZLE.');
