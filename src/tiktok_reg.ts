@@ -1,20 +1,18 @@
 import { chromium } from 'playwright-extra'; 
 import { Page, Locator } from 'playwright';
 import stealthPlugin from 'puppeteer-extra-plugin-stealth';
-import { createCursor } from 'ghost-cursor'; 
-import { readAccountsFromExcel } from './utils/excelReader'; 
+import { readAccountsFromCsv, type AccountRecord } from './utils/csvReader';
 import { humanType, randomDelay } from './utils/humanHelper';
-import { selectGenderMale } from './utils/genderHelper';
 import fs from 'fs';
 import path from 'path';
 
 chromium.use(stealthPlugin());
 
-const DATA_PATH = './data/tiktok_data.xlsx';
+// CSV tanpa header: tiap baris -> email,password (atau email;password)
+const DATA_PATH = './data/accounts.csv';
 const PROFILES_DIR = './profiles_tt';
 const COOKIES_DIR = './cookies_tt';
 const LOGS_DIR = './logs';
-const sex = "male";
 
 [PROFILES_DIR, COOKIES_DIR, LOGS_DIR].forEach(dir => {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir);
@@ -111,7 +109,63 @@ async function fillBirthday(page: any) {
     await randomDelay(1000, 2000);
 }
 
-async function registerTikTok(account: any) {
+async function dismissCommonPopups(page: Page) {
+    const candidates: Locator[] = [
+        page.getByRole('button', { name: /accept|agree|setuju/i }),
+        page.getByRole('button', { name: /tutup|close|got it|ok/i }),
+        page.getByRole('button', { name: /allow|izinkan/i }),
+        page.locator('[aria-label="Close"]'),
+    ];
+
+    for (const loc of candidates) {
+        try {
+            const el = loc.first();
+            if (await el.count() === 0) continue;
+            if (await el.isVisible()) {
+                await el.click({ force: true, timeout: 2000 }).catch(() => {});
+                await randomDelay(250, 600);
+            }
+        } catch {}
+    }
+}
+
+async function waitForOtpFilled(page: Page, timeoutMs = 180000): Promise<boolean> {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+        await dismissCommonPopups(page);
+
+        // Case A: single input 6 digit
+        const single = page.locator('input[type="text"][maxlength="6"], input[inputmode="numeric"][maxlength="6"]');
+        try {
+            if (await single.count()) {
+                const el = single.first();
+                if (await el.isVisible()) {
+                    const v = (await el.inputValue().catch(() => '')) || '';
+                    if (v.replace(/\D/g, '').length === 6) return true;
+                }
+            }
+        } catch {}
+
+        // Case B: 6 separate boxes maxlength=1
+        const boxes = page.locator('input[type="text"][maxlength="1"], input[inputmode="numeric"][maxlength="1"]');
+        try {
+            const n = await boxes.count();
+            if (n >= 6) {
+                let filled = 0;
+                for (let i = 0; i < Math.min(n, 6); i++) {
+                    const v = (await boxes.nth(i).inputValue().catch(() => '')) || '';
+                    if (v.trim().length === 1) filled++;
+                }
+                if (filled === 6) return true;
+            }
+        } catch {}
+
+        await randomDelay(1000, 2000);
+    }
+    return false;
+}
+
+async function registerTikTok(account: AccountRecord) {
     if (!account.email || !account.password) {
         console.log(`[SKIP] Data tidak lengkap.`);
         return;
@@ -133,13 +187,13 @@ async function registerTikTok(account: any) {
     context.setDefaultTimeout(60000); 
 
     const page = await context.pages()[0] || await context.newPage();
-    const cursor = createCursor(page); 
 
     try {
         // 1. OPEN TIKTOK SIGNUP
         console.log('-> Membuka TikTok Signup...');
         await page.goto('https://www.tiktok.com/signup', { waitUntil: 'domcontentloaded' });
         await randomDelay(3000, 5000);
+        await dismissCommonPopups(page);
 
         // 2. KLIK TOMBOL AWAL (Direct Link Fallback)
         console.log('-> Klik "Gunakan nomor telepon atau email"...');
@@ -160,9 +214,11 @@ async function registerTikTok(account: any) {
         
         console.log('-> Menunggu Form Muncul...');
         await page.waitForTimeout(3000);
+        await dismissCommonPopups(page);
 
         // 3. ISI TANGGAL LAHIR (FIXED)
         await fillBirthday(page);
+        await dismissCommonPopups(page);
         
         // 4. PASTIKAN DI TAB EMAIL
         console.log('-> Cek Tab Email...');
@@ -185,6 +241,7 @@ async function registerTikTok(account: any) {
         console.log('-> Mengisi Password...');
         await humanType(page, 'input[type="password"]', account.password);
         await randomDelay(1000, 2000);
+        await dismissCommonPopups(page);
 
         // 6. KLIK KIRIM KODE
         console.log('-> Klik tombol "Kirim Kode"...');
@@ -196,125 +253,16 @@ async function registerTikTok(account: any) {
             console.log('   [WARNING] Tombol Kirim Kode tidak ketemu.');
         }
 
-        // 7. BUKA GMAIL UNTUK AMBIL KODE OTP
-        console.log('-> Membuka Gmail untuk ambil kode OTP...');
-        const gmailPage = await context.newPage();
-        await gmailPage.goto('https://mail.google.com/', { waitUntil: 'domcontentloaded' });
-        await randomDelay(5000, 8000);
-        
-        // 8. LOGIN GMAIL JIKA PERLU
-        if (await gmailPage.isVisible('input[type="email"]')) {
-            console.log('   Login Gmail...');
-            await humanType(gmailPage, 'input[type="email"]', account.email);
-            await gmailPage.click('button:has-text("Berikutnya")', { force: true });
-            await randomDelay(3000, 5000);
-            await humanType(gmailPage, 'input[type="password"]', account.password);
-            await gmailPage.click('button:has-text("Berikutnya")', { force: true });
-            await randomDelay(8000, 12000);
-        }
-        
-        // 9. CARI EMAIL DARI TIKTOK
-        console.log('-> Mencari email dari TikTok...');
-        let otpCode = '';
-        const maxRetries = 12;
-        for (let attempt = 1; attempt <= maxRetries; attempt++) {
-            try {
-                await gmailPage.reload({ waitUntil: 'domcontentloaded' });
-                await randomDelay(5000, 8000);
-                const emailRow = gmailPage.locator('tr').filter({ hasText: 'TikTok' }).first();
-                if (await emailRow.isVisible()) {
-                    console.log('   Email TikTok ditemukan, membukanya...');
-                    await emailRow.click({ force: true });
-                    await randomDelay(5000, 8000);
-                    const emailBody = gmailPage.frameLocator('iframe[name="msg_body"]').locator('body');
-                    const emailText = await emailBody.innerText();
-                    const codeMatch = emailText.match(/(\d{6})/);
-                    if (codeMatch) {
-                        otpCode = codeMatch[1];
-                        console.log(`   Kode OTP Ditemukan: ${otpCode}`);
-                        break;
-                    }
-                } else {
-                    console.log(`   [${attempt}/${maxRetries}] Email TikTok belum ada, menunggu...`);
-                }
-            } catch(e) {
-                console.log(`   [${attempt}/${maxRetries}] Gagal mencari email, coba lagi...`);
-            }
-            await randomDelay(10000, 15000);
-        }
-
-        if (!otpCode) {
-            throw new Error('Gagal mendapatkan kode OTP dari email.');
-        }
-        await gmailPage.close();
-        await randomDelay(2000, 4000);
-        
-        // ISI KODE OTP
-        console.log('-> Mengisi Kode OTP di TikTok...');
-        const codeInputs = await page.$$('input[type="text"][maxlength="1"]');  
-        if (codeInputs.length === 6) {
-            for (let i = 0; i < 6; i++) {
-                await codeInputs[i].fill(otpCode.charAt(i));
-                await randomDelay(300, 600);
-            }   
-        } else {
-            console.log('   [WARNING] Input kode OTP tidak ditemukan sesuai format.');
-        }
-        await randomDelay(2000, 3000);
-
-        // 10. PILIH USERNAME OTOMATIS
-        async function selectGenderMale(page: Page): Promise<void> {
-            console.log('-> Memilih Gender: Male');
-
-            try {
-                const maleOptions: Locator[] = [
-                    page.getByText(/^Male$/i),
-                    page.getByText(/^Laki-laki$/i),
-                    page.getByRole('radio', { name: /male|laki/i }),
-                    page.locator('div').filter({ hasText: /male|laki/i })
-                ];
-
-                for (const opt of maleOptions) {
-                    const el = opt.first();
-
-                    // ✅ cek count dulu (lebih aman dari isVisible error)
-                    if (await el.count() === 0) continue;
-
-                    if (await el.isVisible()) {
-                        await el.click({ force: true });
-                        await randomDelay(500, 1000);
-                        console.log('   Gender Male dipilih');
-                        return;
-                    }
-                }
-
-                console.log('   [INFO] Field gender tidak ditemukan (mungkin dilewati TikTok)');
-            } catch (error) {
-                console.log('   [WARNING] Gagal memilih gender');
-            }
-        }
-
         // . INPUT MANUAL
         console.log('\n================================================================');
-        console.log('✋ WAKTUNYA INPUT MANUAL! (Bot Pause 3 Menit)');
-        console.log('1. Selesaikan PUZZLE.');
-        console.log('2. Masukkan KODE OTP.');
+        console.log('✋ WAKTUNYA INPUT MANUAL!');
+        console.log('1. Selesaikan CAPTCHA/PUZZLE (kalau muncul).');
+        console.log('2. Masukkan KODE OTP dari email.');
         console.log('================================================================\n');
 
-        const codeInputSelector = 'input[type="text"][maxlength="6"]';
-        try {
-            await page.waitForFunction(
-                (selector) => {
-                    const input = document.querySelector(selector) as HTMLInputElement;
-                    return input && input.value.length === 6; 
-                },
-                codeInputSelector,
-                { timeout: 180000 } 
-            );
-            console.log('-> Terdeteksi kode sudah diisi!');
-        } catch (e) {
-            console.log('-> Waktu tunggu habis. Lanjut...');
-        }
+        const otpDetected = await waitForOtpFilled(page, 180000);
+        if (otpDetected) console.log('-> Terdeteksi OTP sudah diisi!');
+        else console.log('-> Waktu tunggu OTP habis. Lanjut...');
 
         await randomDelay(1000, 2000);
 
@@ -345,7 +293,7 @@ async function registerTikTok(account: any) {
 }
 
 (async () => {
-    const accounts = readAccountsFromExcel(DATA_PATH);
+    const accounts = readAccountsFromCsv(DATA_PATH);
     console.log(`Total Akun TikTok: ${accounts.length}`);
 
     for (const acc of accounts) {
